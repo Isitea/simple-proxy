@@ -1,0 +1,17 @@
+[tools]
+python = "3.14"
+
+[tasks.build]
+description = "단일 실행 파일 dist/s-proxy 만들기 (대상 장비에 python3 3.11+ 필요)"
+run = """
+set -e
+d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+cp proxy.py README.md "$d"
+mkdir -p dist
+python3 -m zipapp "$d" -m proxy:cli -o dist/s-proxy -p '/usr/bin/env python3' -c
+ls -l dist/s-proxy
+"""
+
+[tasks.test]
+description = "소켓 통합 테스트"
+run = "python3 test_proxy.py"
