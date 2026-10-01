@@ -3,6 +3,7 @@ import asyncio
 import os
 import signal
 import tempfile
+import tomllib
 from pathlib import Path
 
 import proxy
@@ -16,6 +17,7 @@ CONFIG = """
 19003 = "127.0.0.1:19103"
 19004 = "127.0.0.1:19103"
 19005 = "127.0.0.1:19103"
+19007 = "127.0.0.1:19104"
 19006 = { target = "127.0.0.1:19103", host = "up.local:80", origin = "http://up.local" }
 """
 
@@ -31,6 +33,11 @@ async def upstream(tag, port):
 async def echo(r, w):
     while data := await r.read(1024):
         w.write(data)
+    w.close()
+
+
+async def after_eof(r, w):
+    w.write(b"got " + await r.read())
     w.close()
 
 
@@ -50,7 +57,8 @@ async def fetch(port, host):
 async def main():
     cfg = Path(tempfile.mkdtemp()) / "config.toml"
     cfg.write_text(CONFIG)
-    ups = [await upstream("A", 19101), await upstream("B", 19102), await asyncio.start_server(echo, "127.0.0.1", 19103)]
+    ups = [await upstream("A", 19101), await upstream("B", 19102), await asyncio.start_server(echo, "127.0.0.1", 19103),
+           await asyncio.start_server(after_eof, "127.0.0.1", 19104)]
     server = asyncio.create_task(proxy.serve(cfg))
     await asyncio.sleep(0.3)
 
@@ -73,6 +81,12 @@ async def main():
     assert await asyncio.wait_for(r.readexactly(len(want)), 1) == want, "요청마다 Host/Origin 바꿔 보내기"
     w.close()
 
+    r, w = await asyncio.open_connection("127.0.0.1", 19007)
+    w.write(b"hello")
+    w.write_eof()
+    assert await asyncio.wait_for(r.read(), 1) == b"got hello", "쓰기만 닫아도 응답을 받는다 (half-close)"
+    w.close()
+
     keep, change, remove = [await asyncio.open_connection("127.0.0.1", p) for p in (19003, 19004, 19005)]
     for r, w in (keep, change, remove):
         assert await ping(r, w) == b"hi"
@@ -93,4 +107,21 @@ async def main():
     print("ok")
 
 
+def test_parse_rejects():
+    for bad in ('9000 = { target = "a:1", orgin = "x" }', '9000 = { target = "a:1", host = 7050 }', "9000 = 8000"):
+        try:
+            proxy.parse(tomllib.loads("[forward]\n" + bad))
+        except ValueError:
+            continue
+        raise AssertionError(f"잘못된 규칙을 받아들였다: {bad}")
+
+
+def test_pid_ignores_other_process():
+    proxy.PID = Path(tempfile.mkdtemp()) / "proxy.pid"
+    proxy.PID.write_text(str(os.getppid()))  # 살아 있지만 s-proxy 가 아닌 프로세스
+    assert proxy.pid() is None, "다른 프로세스의 PID 를 s-proxy 로 여기면 안 된다"
+
+
+test_parse_rejects()
+test_pid_ignores_other_process()
 asyncio.run(main())

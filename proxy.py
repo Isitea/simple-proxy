@@ -69,7 +69,14 @@ def parse(data):
                     name = h.lower().rstrip(".")
             else:
                 port = int(key)
-            target, send = (val["target"], (val.get("host"), val.get("origin"))) if isinstance(val, dict) else (val, ())
+            if isinstance(val, dict):
+                if extra := val.keys() - {"target", "host", "origin"}:
+                    raise ValueError(f"모르는 키 {sorted(extra)} (target, host, origin 만 쓸 수 있다)")
+                target, send = val["target"], (val.get("host"), val.get("origin"))
+            else:
+                target, send = val, ()
+            if not all(isinstance(v, str) for v in (target, *send) if v is not None):
+                raise ValueError("값은 문자열이어야 한다")
             routes.setdefault((host, port), {})[name] = Target(*hostport(target), *send)
         except (ValueError, KeyError, AttributeError, TypeError) as e:
             raise ValueError(f"[forward] {key}: {e!r}") from None
@@ -153,23 +160,23 @@ async def pipe_http(head, reader, writer, t):
             head = await read_head(reader)
     except (ConnectionError, ValueError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
         return writer.close()
-    await pipe(reader, writer)  # Upgrade 뒤, 또는 클라이언트가 닫았을 때 (곧바로 끝난다)
+    await pipe(reader, writer)  # Upgrade 뒤, 또는 클라이언트가 쓰기를 닫았을 때 (곧바로 write_eof 하고 끝난다)
 
 
 async def pipe(reader, writer):
+    """EOF 를 받으면 반대쪽의 쓰기만 닫는다 (half-close). 소켓은 양방향이 다 끝난 뒤 handle 이 닫는다."""
     try:
         while data := await reader.read(65536):
             writer.write(data)
             await writer.drain()
+        writer.write_eof()
     except ConnectionError:
-        pass
-    finally:
-        writer.close()
+        writer.close()  # 한쪽이 깨지면 반대쪽도 끊어 다른 방향의 pipe 가 끝나게 한다
 
 
 async def handle(routes, bind, cr, cw):
     rules = routes[bind]  # 접속 시점에 조회한다. 리로드는 다음 연결부터 반영된다.
-    head = name = None
+    head = name = uw = None
     try:
         if any(n or t.send_host or t.send_origin for n, t in rules.items()):  # Host 를 보거나 바꿔야 하는 포트만 헤더를 읽는다
             head = await asyncio.wait_for(cr.readuntil(b"\r\n\r\n"), 10)
@@ -192,6 +199,8 @@ async def handle(routes, bind, cr, cw):
     finally:
         CONNS.pop(asyncio.current_task(), None)
         cw.close()
+        if uw:
+            uw.close()
 
 
 async def serve(path):
@@ -241,12 +250,14 @@ async def serve(path):
 # ---------------------------------------------------------------- 프로세스 관리
 
 def pid():
+    """살아 있는 s-proxy 의 PID. PID 가 다른 프로세스에 재사용됐다면 None (엉뚱한 프로세스를 죽이지 않는다)."""
     try:
         p = int(PID.read_text())
-        os.kill(p, 0)
-        return p
+        args = Path(f"/proc/{p}/cmdline").read_bytes().split(b"\0")
     except (OSError, ValueError):
         return None
+    is_proxy = any(Path(a.decode(errors="replace")).name in ("s-proxy", "proxy.py") for a in args)
+    return p if is_proxy and b"run" in args else None
 
 
 def up(path):
