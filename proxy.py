@@ -27,7 +27,8 @@ MISDIRECTED = b"HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\nConnect
 class Target(NamedTuple):
     host: str
     port: int
-    send_host: str | None = None  # 있으면 첫 요청의 Host 헤더를 이 값으로 바꿔 보낸다
+    send_host: str | None = None  # 있으면 모든 요청의 Host 헤더를 이 값으로 바꿔 보낸다
+    send_origin: str | None = None  # 있으면 모든 요청의 Origin 헤더(있을 때만)를 이 값으로 바꿔 보낸다
 
 
 def log(msg):
@@ -68,8 +69,8 @@ def parse(data):
                     name = h.lower().rstrip(".")
             else:
                 port = int(key)
-            target, send = (val["target"], val.get("host")) if isinstance(val, dict) else (val, None)
-            routes.setdefault((host, port), {})[name] = Target(*hostport(target), send)
+            target, send = (val["target"], (val.get("host"), val.get("origin"))) if isinstance(val, dict) else (val, ())
+            routes.setdefault((host, port), {})[name] = Target(*hostport(target), *send)
         except (ValueError, KeyError, AttributeError, TypeError) as e:
             raise ValueError(f"[forward] {key}: {e!r}") from None
     return routes
@@ -81,6 +82,7 @@ def load(path):
 
 def describe(routes):
     return [f"{h}:{p} [{n or '*'}] -> {t.host}:{t.port}" + (f" (Host: {t.send_host})" if t.send_host else "")
+            + (f" (Origin: {t.send_origin})" if t.send_origin else "")
             for (h, p), rules in routes.items() for n, t in rules.items()]
 
 
@@ -91,8 +93,67 @@ def host_of(head):
     return (m[1].decode("latin-1").strip("[]").lower().rstrip(".") or None) if m else None
 
 
-def set_host(head, host):
-    return re.sub(rb"(?im)^host:[^\r\n]*", lambda _: b"Host: " + host.encode("latin-1"), head, count=1)
+def set_header(head, name, value):
+    """head 의 name 헤더 값을 value 로 바꾼다. 헤더가 없으면 더하지 않는다."""
+    line = name.encode() + b": " + value.encode("latin-1")
+    return re.sub(rb"(?im)^" + name.encode() + rb":[^\r\n]*", lambda _: line, head, count=1)
+
+
+def rewrite(head, t):
+    if t.send_host:
+        head = set_header(head, "Host", t.send_host)
+    if t.send_origin:
+        head = set_header(head, "Origin", t.send_origin)
+    return head
+
+
+async def read_head(reader):
+    """다음 요청의 헤더. 클라이언트가 닫았으면 b""."""
+    try:
+        return await reader.readuntil(b"\r\n\r\n")
+    except asyncio.IncompleteReadError:
+        return b""
+
+
+async def copy_n(reader, writer, n):
+    while n:
+        data = await reader.read(min(n, 65536))
+        if not data:
+            raise asyncio.IncompleteReadError(b"", n)
+        writer.write(data)
+        await writer.drain()
+        n -= len(data)
+
+
+async def copy_chunked(reader, writer):
+    while True:
+        line = await reader.readuntil(b"\r\n")
+        writer.write(line)
+        size = int(line.split(b";")[0], 16)
+        if not size:
+            break
+        await copy_n(reader, writer, size + 2)  # 데이터 + CRLF
+    while (line := await reader.readuntil(b"\r\n")) != b"\r\n":  # trailer
+        writer.write(line)
+    writer.write(line)
+
+
+async def pipe_http(head, reader, writer, t):
+    """요청마다 헤더를 바꿔 보내고 본문은 그대로 넘긴다. Upgrade(WebSocket 등) 요청 뒤로는 바이트 그대로."""
+    try:
+        while head:
+            writer.write(rewrite(head, t))
+            await writer.drain()
+            if re.search(rb"(?im)^upgrade:", head):
+                break
+            if re.search(rb"(?im)^transfer-encoding:.*chunked", head):
+                await copy_chunked(reader, writer)
+            elif m := re.search(rb"(?im)^content-length:[ \t]*(\d+)", head):
+                await copy_n(reader, writer, int(m[1]))
+            head = await read_head(reader)
+    except (ConnectionError, ValueError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+        return writer.close()
+    await pipe(reader, writer)  # Upgrade 뒤, 또는 클라이언트가 닫았을 때 (곧바로 끝난다)
 
 
 async def pipe(reader, writer):
@@ -110,7 +171,7 @@ async def handle(routes, bind, cr, cw):
     rules = routes[bind]  # 접속 시점에 조회한다. 리로드는 다음 연결부터 반영된다.
     head = name = None
     try:
-        if any(n or t.send_host for n, t in rules.items()):  # Host 를 보거나 바꿔야 하는 포트만 헤더를 읽는다
+        if any(n or t.send_host or t.send_origin for n, t in rules.items()):  # Host 를 보거나 바꿔야 하는 포트만 헤더를 읽는다
             head = await asyncio.wait_for(cr.readuntil(b"\r\n\r\n"), 10)
             name = host_of(head)
         t = rules.get(name) or rules.get(None)
@@ -120,9 +181,12 @@ async def handle(routes, bind, cr, cw):
             return
         CONNS[asyncio.current_task()] = (bind, name if name in rules else None, t)
         ur, uw = await asyncio.open_connection(t.host, t.port)
-        if head:
-            uw.write(set_host(head, t.send_host) if t.send_host else head)
-        await asyncio.gather(pipe(cr, uw), pipe(ur, cw))
+        if t.send_host or t.send_origin:
+            await asyncio.gather(pipe_http(head, cr, uw, t), pipe(ur, cw))
+        else:
+            if head:
+                uw.write(head)
+            await asyncio.gather(pipe(cr, uw), pipe(ur, cw))
     except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError) as e:
         log(f"[{bind[1]}] {type(e).__name__}: {e}")
     finally:

@@ -16,3 +16,6 @@ listen_host = "127.0.0.1"
 
 # Host 헤더 바꿔 보내기 (HTTP 전용)
 # 9050 = { target = "192.0.2.10:9000", host = "app.local" }
+
+# Host/Origin 헤더 바꿔 보내기 (HTTP 전용, localhost 만 받는 상류용)
+# 7050 = { target = "127.0.0.1:7050", host = "localhost:7050", origin = "http://localhost:7050" }
