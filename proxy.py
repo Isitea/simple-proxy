@@ -313,11 +313,15 @@ def install():
         return print(f"이미 설치돼 있다: {BIN}")
     BIN.parent.mkdir(parents=True, exist_ok=True)
     tmp = BIN.with_name(BIN.name + ".tmp")  # 임시 파일을 만들어 교체한다. 실행 중인 프로세스는 옛 파일을 그대로 쓴다.
-    shutil.copyfile(src, tmp)
-    tmp.chmod(0o755)
-    tmp.replace(BIN)
+    try:
+        shutil.copyfile(src, tmp)
+        tmp.chmod(0o755)
+        tmp.replace(BIN)
+    except OSError:
+        tmp.unlink(missing_ok=True)  # 디스크 부족 등으로 실패하면 반쯤 쓴 임시 파일을 남기지 않는다
+        raise
     print(f"installed: {BIN}")
-    if str(BIN.parent) not in os.environ["PATH"].split(":"):
+    if str(BIN.parent) not in map(os.path.normpath, os.environ.get("PATH", "").split(":")):
         print(f"주의: {BIN.parent} 가 PATH 에 없다")
 
 
