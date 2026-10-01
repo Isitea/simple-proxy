@@ -280,10 +280,12 @@ def up(path):
 def down():
     p = pid() or sys.exit("not running")
     os.kill(p, signal.SIGTERM)
-    for _ in range(50):
+    for _ in range(90):
         if not pid():
             break
         time.sleep(0.1)
+    else:  # 아직 살아 있다. PID 파일을 남겨 status/down 으로 다시 확인할 수 있게 한다
+        sys.exit(f"SIGTERM timed out (pid {p}, 9s), still running")
     PID.unlink(missing_ok=True)
     print(f"stopped (pid {p})")
 
